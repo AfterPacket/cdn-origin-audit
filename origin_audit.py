@@ -39,19 +39,14 @@ AUTHOR = "AfterPacket"
 AUTHOR_URL = "https://github.com/AfterPacket"
 REPO_URL = "https://github.com/AfterPacket/cdn-origin-audit"
 
-BANNER = rf"""
-[bold cyan]{TOOL_NAME}[/bold cyan]  [white]{VERSION}[/white]
-[dim]Author:[/dim] [bold]{AUTHOR}[/bold]  [blue]{AUTHOR_URL}[/blue]
-[dim]Repo:[/dim]   [blue]{REPO_URL}[/blue]
-[dim]Mode:[/dim]   Passive-first OSINT (active checks require --i-have-authorization)
-"""
-
 DEFAULT_SUBDOMAINS = [
     "www","mail","ftp","cpanel","webmail","direct","origin","dev","test","staging",
     "api","beta","old","legacy","admin","vpn","ns1","ns2","smtp","imap","pop",
     "git","gitlab","jira","grafana","status","dashboard","cdn","static","images",
     "m","mobile","app","portal","support","help","docs","blog","shop",
-    "sso","auth","login","files","downloads","uploads","assets"
+    "sso","auth","login","files","downloads","uploads","assets",
+    # extra common infra labels
+    "server","panel","webmin","grafana","prometheus","kibana","jenkins","ci","cd"
 ]
 
 DEFAULT_PATHS = [
@@ -97,8 +92,9 @@ class IPEnrichment:
     country: Optional[str]
     raw: Optional[Dict[str, Any]]
 
+
 # -----------------------------
-# Helpers
+# Banner helpers (dynamic)
 # -----------------------------
 def _get_flag(args, name: str, default=False):
     return getattr(args, name, default)
@@ -155,9 +151,6 @@ def build_banner(args, target_domain: str = "") -> str:
     mode = _mode_label(args)
     sources = _enabled_sources(args)
 
-    # Optional: show target
-    target_line = f"[dim]Target:[/dim] {target_domain}\n" if target_domain else ""
-
     if mode.startswith("ACTIVE (AUTHORIZED)"):
         color = "green"
     elif mode.startswith("ACTIVE REQUESTED"):
@@ -166,6 +159,8 @@ def build_banner(args, target_domain: str = "") -> str:
         color = "cyan"
     else:
         color = "blue"
+
+    target_line = f"[dim]Target:[/dim] {target_domain}\n" if target_domain else ""
 
     return (
         f"\n[bold {color}]{TOOL_NAME}[/bold {color}]  [white]{VERSION}[/white]\n"
@@ -177,15 +172,11 @@ def build_banner(args, target_domain: str = "") -> str:
     )
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def normalize_host(h: str) -> str:
     return h.strip().lower().rstrip(".")
-
-def is_ip(s: str) -> bool:
-    try:
-        ipaddress.ip_address(s)
-        return True
-    except Exception:
-        return False
 
 async def run_blocking(fn, *args):
     loop = asyncio.get_running_loop()
@@ -211,17 +202,41 @@ def guess_cloud_provider(ptr: Optional[str], org: Optional[str], asn: Optional[s
         return "Cloudflare"
     return None
 
-async def fetch_json(session: aiohttp.ClientSession, url: str, *, headers=None, params=None, timeout=25) -> Optional[Any]:
+async def fetch_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    headers=None,
+    params=None,
+    timeout=25,
+    debug: bool = False
+) -> Optional[Any]:
     try:
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            if r.status >= 400:
-                return None
+        async with session.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as r:
             text = await r.text()
+
+            if r.status >= 400:
+                if debug:
+                    print(f"[yellow]API error[/yellow] {r.status} {url}")
+                    snippet = text[:300].replace("\n", " ")
+                    if snippet:
+                        print(f"[dim]{snippet}[/dim]")
+                return None
+
             try:
                 return json.loads(text)
             except Exception:
+                if debug:
+                    print(f"[yellow]JSON parse failed[/yellow] {url}")
                 return None
-    except Exception:
+    except Exception as e:
+        if debug:
+            print(f"[yellow]Request failed[/yellow] {url} err={e}")
         return None
 
 async def fetch_text(session: aiohttp.ClientSession, url: str, *, timeout=20) -> Optional[str]:
@@ -232,6 +247,7 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, *, timeout=20) ->
             return await r.text()
     except Exception:
         return None
+
 
 # -----------------------------
 # Cloudflare IP ranges (best-effort)
@@ -266,6 +282,7 @@ def is_cloudflare_host(dns: HostDNS, cf_nets: List[ipaddress._BaseNetwork]) -> b
         return True
     return any(is_cloudflare_ip(ip, cf_nets) for ip in dns.a + dns.aaaa)
 
+
 # -----------------------------
 # DNS resolving
 # -----------------------------
@@ -287,14 +304,15 @@ async def resolve_host(resolver: dns.asyncresolver.Resolver, host: str) -> HostD
     mx = [re.split(r"\s+", x, maxsplit=1)[-1].rstrip(".") if " " in x else x.rstrip(".") for x in mx_raw]
     return HostDNS(host=host, a=a, aaaa=aaaa, cname=cname, ns=ns, mx=mx, txt=txt)
 
+
 # -----------------------------
 # crt.sh (passive)
 # -----------------------------
-async def crtsh_subdomains(session: aiohttp.ClientSession, domain: str) -> Set[str]:
+async def crtsh_subdomains(session: aiohttp.ClientSession, domain: str, *, debug: bool = False) -> Set[str]:
     domain = normalize_host(domain)
     url = "https://crt.sh/"
     params = {"q": f"%.{domain}", "output": "json"}
-    data = await fetch_json(session, url, params=params, timeout=35)
+    data = await fetch_json(session, url, params=params, timeout=35, debug=debug)
     out: Set[str] = set()
     if not isinstance(data, list):
         return out
@@ -310,18 +328,33 @@ async def crtsh_subdomains(session: aiohttp.ClientSession, domain: str) -> Set[s
                 out.add(h)
     return out
 
+
 # -----------------------------
 # SecurityTrails (passive)
 # -----------------------------
 SECURITYTRAILS_BASE = "https://api.securitytrails.com/v1"
 
-async def st_get(session: aiohttp.ClientSession, apikey: str, path: str, params: Optional[Dict[str, str]] = None) -> Optional[Any]:
+async def st_get(
+    session: aiohttp.ClientSession,
+    apikey: str,
+    path: str,
+    *,
+    params: Optional[Dict[str, str]] = None,
+    debug: bool = False
+) -> Optional[Any]:
     headers = {"APIKEY": apikey}
-    return await fetch_json(session, SECURITYTRAILS_BASE + path, headers=headers, params=params, timeout=25)
+    return await fetch_json(
+        session,
+        SECURITYTRAILS_BASE + path,
+        headers=headers,
+        params=params,
+        timeout=25,
+        debug=debug,
+    )
 
-async def st_subdomains(session: aiohttp.ClientSession, apikey: str, domain: str) -> Set[str]:
+async def st_subdomains(session: aiohttp.ClientSession, apikey: str, domain: str, *, debug: bool = False) -> Set[str]:
     domain = normalize_host(domain)
-    data = await st_get(session, apikey, f"/domain/{domain}/subdomains")
+    data = await st_get(session, apikey, f"/domain/{domain}/subdomains", debug=debug)
     out: Set[str] = set()
     if isinstance(data, dict) and isinstance(data.get("subdomains"), list):
         for s in data["subdomains"]:
@@ -329,27 +362,35 @@ async def st_subdomains(session: aiohttp.ClientSession, apikey: str, domain: str
                 out.add(normalize_host(f"{s}.{domain}"))
     return out
 
-async def st_dns_history(session: aiohttp.ClientSession, apikey: str, hostname: str, rtype: str) -> Optional[Any]:
+async def st_dns_history(session: aiohttp.ClientSession, apikey: str, hostname: str, rtype: str, *, debug: bool = False) -> Optional[Any]:
     hostname = normalize_host(hostname)
-    return await st_get(session, apikey, f"/history/{hostname}/dns/{rtype.lower()}")
+    return await st_get(session, apikey, f"/history/{hostname}/dns/{rtype.lower()}", debug=debug)
 
-async def st_ip_whois(session: aiohttp.ClientSession, apikey: str, ip: str) -> Optional[Dict[str, Any]]:
-    data = await st_get(session, apikey, f"/ips/{ip}/whois")
+async def st_ip_whois(session: aiohttp.ClientSession, apikey: str, ip: str, *, debug: bool = False) -> Optional[Dict[str, Any]]:
+    data = await st_get(session, apikey, f"/ips/{ip}/whois", debug=debug)
     return data if isinstance(data, dict) else None
+
 
 # -----------------------------
 # ViewDNS (passive)
 # -----------------------------
 VIEWDNS_BASE = "https://api.viewdns.info"
 
-async def viewdns_get(session: aiohttp.ClientSession, apikey: str, path: str, params: Dict[str, str]) -> Optional[Any]:
+async def viewdns_get(
+    session: aiohttp.ClientSession,
+    apikey: str,
+    path: str,
+    params: Dict[str, str],
+    *,
+    debug: bool = False
+) -> Optional[Any]:
     q = dict(params)
     q["apikey"] = apikey
     q.setdefault("output", "json")
-    return await fetch_json(session, VIEWDNS_BASE + path, params=q, timeout=25)
+    return await fetch_json(session, VIEWDNS_BASE + path, params=q, timeout=25, debug=debug)
 
-async def viewdns_ip_history(session: aiohttp.ClientSession, apikey: str, domain: str) -> List[Dict[str, Any]]:
-    data = await viewdns_get(session, apikey, "/iphistory/", {"domain": normalize_host(domain)})
+async def viewdns_ip_history(session: aiohttp.ClientSession, apikey: str, domain: str, *, debug: bool = False) -> List[Dict[str, Any]]:
+    data = await viewdns_get(session, apikey, "/iphistory/", {"domain": normalize_host(domain)}, debug=debug)
     if not isinstance(data, dict):
         return []
     resp = data.get("response", {})
@@ -357,11 +398,11 @@ async def viewdns_ip_history(session: aiohttp.ClientSession, apikey: str, domain
         return [x for x in resp["records"] if isinstance(x, dict)]
     return []
 
-async def viewdns_reverse_ip(session: aiohttp.ClientSession, apikey: str, host_or_ip: str, max_pages: int = 3) -> List[Dict[str, Any]]:
+async def viewdns_reverse_ip(session: aiohttp.ClientSession, apikey: str, host_or_ip: str, max_pages: int = 3, *, debug: bool = False) -> List[Dict[str, Any]]:
     host_or_ip = host_or_ip.strip()
     out: List[Dict[str, Any]] = []
     for page in range(1, max_pages + 1):
-        data = await viewdns_get(session, apikey, "/reverseip/", {"host": host_or_ip, "page": str(page)})
+        data = await viewdns_get(session, apikey, "/reverseip/", {"host": host_or_ip, "page": str(page)}, debug=debug)
         if not isinstance(data, dict):
             break
         resp = data.get("response", {})
@@ -373,6 +414,7 @@ async def viewdns_reverse_ip(session: aiohttp.ClientSession, apikey: str, host_o
         else:
             break
     return out
+
 
 # -----------------------------
 # IP enrichment (RDAP/WHOIS)
@@ -396,14 +438,80 @@ def pick_fields(raw: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[
     country = raw.get("asn_country_code") or (raw.get("network", {}) or {}).get("country")
     return (str(asn) if asn else None, str(org) if org else None, str(country) if country else None)
 
-async def enrich_ip(session: aiohttp.ClientSession, ip: str, st_key: Optional[str]) -> IPEnrichment:
+async def enrich_ip(session: aiohttp.ClientSession, ip: str, st_key: Optional[str], *, debug: bool = False) -> IPEnrichment:
     ptr = await safe_gethostbyaddr(ip)
-    raw = await st_ip_whois(session, st_key, ip) if st_key else None
+    raw = await st_ip_whois(session, st_key, ip, debug=debug) if st_key else None
     if raw is None:
         raw = await run_blocking(rdap_lookup, ip)
     asn, org, country = pick_fields(raw)
     provider = guess_cloud_provider(ptr, org, asn)
     return IPEnrichment(ip=ip, ptr=ptr, provider_guess=provider, asn=asn, org=org, country=country, raw=raw if raw else None)
+
+
+# -----------------------------
+# SecurityTrails history formatting helpers
+# -----------------------------
+def st_summarize(obj: Any) -> str:
+    if not isinstance(obj, dict):
+        return "n/a"
+    for k in ("records", "items", "history", "result", "current"):
+        v = obj.get(k)
+        if isinstance(v, list):
+            return f"{k}={len(v)}"
+        if isinstance(v, dict):
+            return f"{k}=dict"
+    return "keys=" + ",".join(list(obj.keys())[:8]) if obj else "empty"
+
+def st_extract_values(obj: Any, limit: int = 10) -> List[str]:
+    """
+    Best-effort extraction of values from SecurityTrails history responses.
+    Handles common shapes:
+      - {"records": [{"values": [{"ip": "1.2.3.4"}]}]}
+      - {"records": [{"values": [{"value": "target"}]}]}
+      - {"records": [{"values": ["1.2.3.4", ...]}]}
+    """
+    if not isinstance(obj, dict):
+        return []
+    recs = obj.get("records")
+    if not isinstance(recs, list):
+        return []
+
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def add(v: str):
+        v = str(v).strip()
+        if not v or v in seen:
+            return
+        seen.add(v)
+        out.append(v)
+
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+        vals = rec.get("values")
+        if isinstance(vals, list):
+            for item in vals:
+                if isinstance(item, dict):
+                    if "ip" in item:
+                        add(item["ip"])
+                    elif "value" in item:
+                        add(item["value"])
+                    elif "hostname" in item:
+                        add(item["hostname"])
+                else:
+                    add(item)
+        # sometimes record may directly contain "ip" or "value"
+        if "ip" in rec:
+            add(rec["ip"])
+        if "value" in rec:
+            add(rec["value"])
+
+        if len(out) >= limit:
+            break
+
+    return out[:limit]
+
 
 # -----------------------------
 # AUTHORIZED-ONLY active checks
@@ -418,34 +526,55 @@ async def safe_banner_check(session: aiohttp.ClientSession, host: str, *, timeou
 
     async def one(url: str) -> HTTPBanner:
         try:
-            async with session.head(url, headers=headers, allow_redirects=False,
-                                    timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-                return HTTPBanner(url=url, status=r.status,
-                                  server=r.headers.get("Server"),
-                                  content_type=r.headers.get("Content-Type"),
-                                  location=r.headers.get("Location"))
+            async with session.head(
+                url,
+                headers=headers,
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as r:
+                return HTTPBanner(
+                    url=url,
+                    status=r.status,
+                    server=r.headers.get("Server"),
+                    content_type=r.headers.get("Content-Type"),
+                    location=r.headers.get("Location"),
+                )
         except Exception:
             # tiny GET fallback with Range
             try:
                 h2 = dict(headers)
                 h2["Range"] = "bytes=0-1024"
-                async with session.get(url, headers=h2, allow_redirects=False,
-                                       timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                async with session.get(
+                    url,
+                    headers=h2,
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as r:
                     try:
                         await r.content.read(256)
                     except Exception:
                         pass
-                    return HTTPBanner(url=url, status=r.status,
-                                      server=r.headers.get("Server"),
-                                      content_type=r.headers.get("Content-Type"),
-                                      location=r.headers.get("Location"))
+                    return HTTPBanner(
+                        url=url,
+                        status=r.status,
+                        server=r.headers.get("Server"),
+                        content_type=r.headers.get("Content-Type"),
+                        location=r.headers.get("Location"),
+                    )
             except Exception:
                 return HTTPBanner(url=url, status=None, server=None, content_type=None, location=None)
 
     return [await one(f"https://{host}/"), await one(f"http://{host}/")]
 
-async def safe_path_checks(session: aiohttp.ClientSession, host: str, paths: List[str],
-                           *, timeout=8, min_delay=0.2, max_delay=0.8) -> List[PathCheck]:
+async def safe_path_checks(
+    session: aiohttp.ClientSession,
+    host: str,
+    paths: List[str],
+    *,
+    timeout=8,
+    min_delay=0.2,
+    max_delay=0.8
+) -> List[PathCheck]:
     host = normalize_host(host)
     headers = {
         "User-Agent": f"{TOOL_NAME}/{VERSION} (+{REPO_URL})",
@@ -456,11 +585,18 @@ async def safe_path_checks(session: aiohttp.ClientSession, host: str, paths: Lis
     async def check(url: str) -> PathCheck:
         await asyncio.sleep(random.uniform(min_delay, max_delay))
         try:
-            async with session.head(url, headers=headers, allow_redirects=False,
-                                    timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-                return PathCheck(url=url, status=r.status,
-                                 server=r.headers.get("Server"),
-                                 location=r.headers.get("Location"))
+            async with session.head(
+                url,
+                headers=headers,
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as r:
+                return PathCheck(
+                    url=url,
+                    status=r.status,
+                    server=r.headers.get("Server"),
+                    location=r.headers.get("Location"),
+                )
         except Exception:
             return PathCheck(url=url, status=None, server=None, location=None)
 
@@ -472,24 +608,26 @@ async def safe_path_checks(session: aiohttp.ClientSession, host: str, paths: Lis
             results.append(await check(f"{scheme}://{host}{pth}"))
     return results
 
+
 # -----------------------------
 # Main
 # -----------------------------
 async def main():
     ap = argparse.ArgumentParser(
-        description="cdn-origin-audit: Passive OSINT origin exposure audit (Cloudflare-aware). Active checks require explicit authorization flag."
+        description=f"{TOOL_NAME}: Passive OSINT origin exposure audit (Cloudflare-aware). Active checks require explicit authorization flag."
     )
     ap.add_argument("domain", help="Target domain (use only with permission for active checks).")
 
     # UI / metadata
     ap.add_argument("--version", action="store_true", help="Print version and exit.")
     ap.add_argument("--no-banner", action="store_true", help="Disable banner output.")
+    ap.add_argument("--debug-api", action="store_true", help="Print API HTTP errors/status for crt.sh / SecurityTrails / ViewDNS.")
 
     # Passive sources
     ap.add_argument("--crtsh", action="store_true", help="Passive: crt.sh CT subdomain discovery.")
-    ap.add_argument("--securitytrails", action="store_true", help="Passive: SecurityTrails subdomains + DNS history + IP whois (key required).")
+    ap.add_argument("--securitytrails", action="store_true", help="Passive: SecurityTrails subdomains + IP whois (key required).")
     ap.add_argument("--viewdns", action="store_true", help="Passive: ViewDNS IP history + reverse IP (key required).")
-    ap.add_argument("--dns-history", action="store_true", help="Passive: DNS history for apex + www via SecurityTrails (key required).")
+    ap.add_argument("--dns-history", action="store_true", help="Passive: SecurityTrails DNS history for apex + www (key required).")
     ap.add_argument("--reverseip", action="store_true", help="Passive: Reverse IP for candidate IPs via ViewDNS (key required).")
 
     # Host discovery controls
@@ -512,17 +650,16 @@ async def main():
     args = ap.parse_args()
 
     if args.version:
-        print(f"{TOOL_NAME} {VERSION} — {AUTHOR} ({AUTHOR_URL})")
+        print(f"{TOOL_NAME} {VERSION} - {AUTHOR} ({AUTHOR_URL})")
         return
 
     if not args.no_banner:
-       # domain is already normalized shortly after parsing in your script
-       # If you print before normalization, just pass args.domain
-       CONSOLE.print(build_banner(args, target_domain=args.domain))
-
+        CONSOLE.print(build_banner(args, target_domain=args.domain))
 
     domain = normalize_host(args.domain)
+    debug_api = bool(args.debug_api)
 
+    # keys
     st_key = os.getenv("SECURITYTRAILS_APIKEY") if (args.securitytrails or args.dns_history) else None
     vd_key = os.getenv("VIEWDNS_APIKEY") if (args.viewdns or args.reverseip) else None
 
@@ -553,24 +690,27 @@ async def main():
         # Passive enrichment: crt.sh
         crt_hosts: Set[str] = set()
         if args.crtsh:
-            crt_hosts = await crtsh_subdomains(session, domain)
+            crt_hosts = await crtsh_subdomains(session, domain, debug=debug_api)
             hosts |= crt_hosts
+            print(f"\n[bold]crt.sh subdomains:[/bold] {len(crt_hosts)} found")
 
         # Passive enrichment: SecurityTrails subdomains
         st_hosts: Set[str] = set()
-        st_dns_hist: Dict[str, Any] = {}
-        if args.securitytrails and st_key:
-            st_hosts = await st_subdomains(session, st_key, domain)
-            hosts |= st_hosts
-        elif args.securitytrails and not st_key:
-            print("[yellow]SECURITYTRAILS_APIKEY not set; skipping SecurityTrails.[/yellow]")
+        if args.securitytrails:
+            if not st_key:
+                print("[yellow]SECURITYTRAILS_APIKEY not set; skipping SecurityTrails.[/yellow]")
+            else:
+                st_hosts = await st_subdomains(session, st_key, domain, debug=debug_api)
+                hosts |= st_hosts
+                print(f"[bold]SecurityTrails subdomains:[/bold] {len(st_hosts)} found")
 
         # Passive: ViewDNS IP history (apex)
         vd_ip_history: List[Dict[str, Any]] = []
-        if args.viewdns and vd_key:
-            vd_ip_history = await viewdns_ip_history(session, vd_key, domain)
-        elif args.viewdns and not vd_key:
-            print("[yellow]VIEWDNS_APIKEY not set; skipping ViewDNS.[/yellow]")
+        if args.viewdns:
+            if not vd_key:
+                print("[yellow]VIEWDNS_APIKEY not set; skipping ViewDNS.[/yellow]")
+            else:
+                vd_ip_history = await viewdns_ip_history(session, vd_key, domain, debug=debug_api)
 
         # Cap
         if len(hosts) > args.max_hosts:
@@ -597,16 +737,17 @@ async def main():
                 if ip and not is_cloudflare_ip(ip, cf_nets):
                     origin_candidate_ips.add(ip)
 
-        # Passive: DNS history (apex + www)
+        # Passive: SecurityTrails DNS history (apex + www)
+        st_dns_hist: Dict[str, Any] = {}
         if args.dns_history:
             if not st_key:
                 print("[yellow]SECURITYTRAILS_APIKEY not set; skipping DNS history.[/yellow]")
             else:
                 for hn in [domain, f"www.{domain}"]:
                     st_dns_hist[hn] = {
-                        "a": await st_dns_history(session, st_key, hn, "a"),
-                        "aaaa": await st_dns_history(session, st_key, hn, "aaaa"),
-                        "cname": await st_dns_history(session, st_key, hn, "cname"),
+                        "a": await st_dns_history(session, st_key, hn, "a", debug=debug_api),
+                        "aaaa": await st_dns_history(session, st_key, hn, "aaaa", debug=debug_api),
+                        "cname": await st_dns_history(session, st_key, hn, "cname", debug=debug_api),
                     }
 
         # Enrich IPs
@@ -616,7 +757,7 @@ async def main():
 
             async def enrich_one(ip: str):
                 async with ip_sem:
-                    enriched_ips[ip] = await enrich_ip(session, ip, st_key)
+                    enriched_ips[ip] = await enrich_ip(session, ip, st_key, debug=debug_api)
 
             await asyncio.gather(*(enrich_one(ip) for ip in sorted(origin_candidate_ips)))
 
@@ -630,7 +771,7 @@ async def main():
 
                 async def rip_one(ip: str):
                     async with rip_sem:
-                        reverseip_results[ip] = await viewdns_reverse_ip(session, vd_key, ip)
+                        reverseip_results[ip] = await viewdns_reverse_ip(session, vd_key, ip, debug=debug_api)
 
                 await asyncio.gather(*(rip_one(ip) for ip in sorted(origin_candidate_ips)))
 
@@ -642,7 +783,6 @@ async def main():
             print("[red]Active checks requested but --i-have-authorization was NOT provided. Skipping all active checks.[/red]")
 
         if args.i_have_authorization:
-            # Only check “interesting” hosts: apex/www + any host that resolves to non-CF IP
             interesting = {domain, f"www.{domain}"}
             for h, d in dns_results.items():
                 if any(ip and not is_cloudflare_ip(ip, cf_nets) for ip in d.a + d.aaaa):
@@ -656,7 +796,6 @@ async def main():
                         http_results[h] = [asdict(b) for b in await safe_banner_check(session, h)]
                 await asyncio.gather(*(http_one(h) for h in sorted(interesting)))
 
-            # Path list
             paths = list(DEFAULT_PATHS)
             if args.paths_file:
                 try:
@@ -718,6 +857,26 @@ async def main():
         else:
             print("\n[green]No non-Cloudflare IPs exposed via DNS on discovered hosts.[/green]")
 
+        if st_dns_hist:
+            print("\n[bold]SecurityTrails DNS History (apex + www):[/bold]")
+            for hn, hist in st_dns_hist.items():
+                a_obj = hist.get("a")
+                aaaa_obj = hist.get("aaaa")
+                cname_obj = hist.get("cname")
+                print(f"  • {hn}: A({st_summarize(a_obj)}) AAAA({st_summarize(aaaa_obj)}) CNAME({st_summarize(cname_obj)})")
+
+                # show a few extracted values (best-effort)
+                a_vals = st_extract_values(a_obj, limit=8)
+                aaaa_vals = st_extract_values(aaaa_obj, limit=8)
+                cname_vals = st_extract_values(cname_obj, limit=8)
+
+                if a_vals:
+                    print(f"      A values: {', '.join(a_vals)}")
+                if aaaa_vals:
+                    print(f"      AAAA values: {', '.join(aaaa_vals)}")
+                if cname_vals:
+                    print(f"      CNAME values: {', '.join(cname_vals)}")
+
         if vd_ip_history:
             print("\n[bold]ViewDNS IP History (apex):[/bold]")
             shown, seen = 0, set()
@@ -760,9 +919,12 @@ async def main():
             "tool": {"name": TOOL_NAME, "version": VERSION, "author": AUTHOR, "author_url": AUTHOR_URL, "repo_url": REPO_URL},
             "domain": domain,
             "sources": {
-                "crtsh": sorted(crt_hosts),
-                "securitytrails": bool(args.securitytrails),
-                "viewdns": bool(args.viewdns),
+                "crtsh_hosts": sorted(crt_hosts),
+                "securitytrails_hosts": sorted(st_hosts),
+                "viewdns_enabled": bool(args.viewdns),
+                "securitytrails_enabled": bool(args.securitytrails),
+                "dns_history_enabled": bool(args.dns_history),
+                "reverseip_enabled": bool(args.reverseip),
                 "bruteforce_enabled": not args.no_bruteforce,
             },
             "dns": {h: asdict(d) for h, d in dns_results.items()},
