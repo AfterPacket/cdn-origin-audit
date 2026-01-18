@@ -1,90 +1,109 @@
-# cdn-origin-audit 🔎🛡️
+cdn-origin-audit 🔎🛡️
+Passive-first subdomain + DNS + hosting attribution toolkit for authorized security testing and defensive audits.
 
-Passive-first **subdomain + DNS + hosting attribution** toolkit for **authorized security testing** and defensive audits.
+Built and maintained by AfterPacket
 
-This tool helps you:
-- Discover **historical subdomains** via Certificate Transparency (crt.sh)
-- Pull **DNS history** via SecurityTrails / ViewDNS (API-based)
-- Run **reverse IP lookups** to understand shared hosting / neighbors
-- Fingerprint likely **cloud provider** (AWS / GCP / Azure) via PTR + RDAP/WHOIS
-- Perform **safe HTTP banner checks** and **path checks** (subfolder checks) **only when authorized**
+Overview
+This tool streamlines the process of uncovering infrastructure origins and bypasses. It helps you:
 
-> ✅ Designed for defensive work and professional audits.  
-> 🔒 **Passive OSINT is default.** Active checks require an explicit authorization flag.
+Discover historical subdomains via Certificate Transparency (crt.sh).
 
----
+Pull DNS history via SecurityTrails (apex + www) and ViewDNS (IP history).
 
-## Features
+Run reverse IP lookups to understand shared hosting / neighbors (ViewDNS).
 
-### Passive (OSINT) Recon
-- **crt.sh CT log scraping** for historical subdomains
-- **DNS resolution**: A / AAAA / CNAME / NS / MX / TXT
-- **Cloudflare detection**
-  - NS (`*.ns.cloudflare.com`)
-  - CNAME (`cdn.cloudflare.net`)
-  - Cloudflare published IP ranges (v4/v6)
-- **Origin candidate identification**
-  - Collects **non-Cloudflare A/AAAA** IPs exposed by subdomains
-- **Provider / hosting fingerprinting**
-  - PTR + RDAP/WHOIS enrichment
-  - Heuristics for **AWS / GCP / Azure / Cloudflare**
-- **DNS history** (API)
-  - SecurityTrails DNS history for apex + `www`
-  - ViewDNS IP history
-- **Reverse IP lookups** (API)
-  - Identify other domains sharing candidate IPs (useful for scoping shared infra)
+Fingerprint cloud providers (AWS / GCP / Azure) via PTR + RDAP/WHOIS.
 
-### Authorized Active Checks (Opt-in)
-- **Safe HTTP banner checks** (`HEAD` → tiny `GET` fallback)
-- **Subfolder/path checks** (conservative defaults like `robots.txt`, `sitemap.xml`, `/.well-known/security.txt`)
-- Captures:
-  - status codes
-  - `Server` header
-  - redirects (`Location`)
+Perform safe HTTP banner checks and path checks only when authorized.
 
-> Active checks are **disabled unless** you pass `--i-have-authorization`.
+[!IMPORTANT] ✅ Designed for defensive work and professional audits.
 
----
+🔒 Passive OSINT is the default posture.
 
-## Project Layout
+⚠️ Active checks require the --i-have-authorization flag.
 
-```text
+Features
+📡 Passive (OSINT) Recon
+crt.sh CT log scraping for historical subdomains.
+
+SecurityTrails subdomain discovery (via API).
+
+DNS resolution: A / AAAA / CNAME / NS / MX / TXT.
+
+Cloudflare detection:
+
+NS (*.ns.cloudflare.com)
+
+CNAME (cdn.cloudflare.net)
+
+Cloudflare published IP ranges (v4/v6).
+
+Origin candidate identification: Collects non-Cloudflare A/AAAA IPs exposed by subdomains.
+
+Provider fingerprinting:
+
+PTR + RDAP/WHOIS enrichment.
+
+Heuristics for AWS / GCP / Azure / Cloudflare.
+
+DNS History:
+
+SecurityTrails: Summary + extraction of historical A/AAAA/CNAME values.
+
+ViewDNS IP history: Shows historical IPs and last-seen dates.
+
+Reverse IP lookups: Identify other domains sharing candidate IPs to scope shared infra.
+
+⚡ Authorized Active Checks (Opt-in)
+Safe HTTP banner checks: Uses HEAD requests with a tiny GET fallback.
+
+Subfolder/path checks: Conservative defaults (e.g., robots.txt, sitemap.xml, /.well-known/security.txt).
+
+Data Captured: Status codes, Server headers, and redirects (Location).
+
+Project Layout
+Plaintext
+
 .
-├── origin_audit.py
-├── requires.txt
-├── requirements.txt
-└── README.md
+├── origin_audit.py     # Main engine
+├── requires.txt        # Dependency list
+├── requirements.txt    # Standard dependency list
+└── README.md           # Documentation
+Installation
+You can install dependencies using either file provided in the repository:
 
-```
+Bash
 
-Install
-Option A: install from requires.txt (this repo)
-bash
-Copy code
-pip install -r requires.txt
-Option B: install from requirements.txt (common tooling expects this)
-bash
-Copy code
+# Option A: Standard install
 pip install -r requirements.txt
-Optional API keys (enable extra passive enrichment):
 
-SecurityTrails: SECURITYTRAILS_APIKEY
+# Option B: Alternative install
+pip install -r requires.txt
+API Keys (Optional)
+To enable advanced passive enrichment, set your API keys as environment variables.
 
-ViewDNS: VIEWDNS_APIKEY
+Service	Variable Name
+SecurityTrails	SECURITYTRAILS_APIKEY
+ViewDNS	VIEWDNS_APIKEY
 
-```bash
+Export to Sheets
+
+Configuration
+Linux / macOS
+
+Bash
+
 export SECURITYTRAILS_APIKEY="YOUR_KEY"
 export VIEWDNS_APIKEY="YOUR_KEY"
-```
-For Windows 
+Windows (PowerShell)
 
-```bash
- $env:SECURITYTRAILS_APIKEY="YOUR_KEY"
- $env:VIEWDNS_APIKEY="YOUR_KEY"
-```
-Usage
-Passive OSINT only (recommended baseline)
-```bash
+PowerShell
+
+$env:SECURITYTRAILS_APIKEY="YOUR_KEY"
+$env:VIEWDNS_APIKEY="YOUR_KEY"
+Usage Examples
+1. Passive OSINT Only (Recommended Baseline)
+Bash
 
 python origin_audit.py example.com \
   --crtsh \
@@ -93,95 +112,70 @@ python origin_audit.py example.com \
   --dns-history \
   --reverseip \
   --output passive_report.json
-Authorized active testing (your domains / explicit permission only)
-```
-```bash
+2. Authorized Active Testing
+Use only on domains you own or have explicit permission to test.
+
+Bash
 
 python origin_audit.py example.com \
   --http \
   --paths \
   --i-have-authorization \
   --output active_report.json
-Custom subdomain wordlist
-```
-```bash
-python origin_audit.py example.com \
-  --wordlist subdomains.txt \
-  --crtsh \
-  --output report.json
-Custom path list (authorized only)
-Create paths.txt:
-```
-```txt
+3. Custom Subdomain & Path Audits
+Bash
 
-/admin
-/login
-/status
-/health
-/.well-known/security.txt
-```
-Run:
+# Using a custom subdomain wordlist
+python origin_audit.py example.com --wordlist subdomains.txt --crtsh
 
-```bash
+# Using a custom path list for active checks
 python origin_audit.py example.com \
   --paths-file paths.txt \
   --i-have-authorization \
   --output paths_report.json
-```
+Output Data
+Console Output
+DNS summary per host and Cloudflare detection flags.
 
-Output
-Console tables
-DNS summary per host
+Origin candidate IP summary (non-Cloudflare exposures).
 
-Cloudflare detection flags
+SecurityTrails & ViewDNS history summaries.
 
-Non-Cloudflare candidate IPs enriched with:
+Authorized-only results (HTTP banners/Paths) if enabled.
 
-PTR
+JSON Report
+Use --output report.json to export structured data including:
 
-ASN / Org
+Discovered subdomains grouped by source.
 
-Country (when available)
+Full DNS record sets.
 
-Provider guess (AWS/GCP/Azure)
+Enriched IP metadata (RDAP/WHOIS).
 
-JSON report
-Use --output report.json to export:
+Reverse IP and History results.
 
-discovered subdomains (by source)
+CLI Flag Reference
+Flag	Description
+--securitytrails	SecurityTrails subdomain discovery
+--dns-history	SecurityTrails DNS history (apex + www)
+--crtsh	CT-based historical subdomains
+--viewdns	ViewDNS IP history
+--reverseip	Reverse-IP lookups (ViewDNS)
+--debug-api	Show API failures (401/429/etc.)
+--i-have-authorization	Required to enable active checks
+--http / --paths	Enable banner and path checking
 
-all DNS records
+Export to Sheets
 
-cloudflare_hosts list
-
-origin_candidate_ips list
-
-enriched IP metadata
-
-dns history (if enabled)
-
-reverse IP results (if enabled)
-
-authorized banner/path results (if enabled)
-
-# Safety / Ethics
-✅ Passive OSINT features are safe and low risk.
+Safety & Ethics
+✅ Passive OSINT features are safe and low-risk.
 
 🔒 Active web checks are rate-limited and minimal.
 
-🚫 No exploit logic.
+🚫 No exploit logic, credential attacks, or access control bypassing.
 
-🚫 No credential attacks.
+License: GPLv3 (Copyleft)
 
-🚫 No bypassing access controls.
+Disclaimer: This repository is provided for authorized security testing and defensive auditing. You are responsible for ensuring you have proper permission before running active checks.
 
-Use only for systems you own or where you have explicit written permission.
-
-# License
-
-
-GPLv3 (copyleft)
-
-# Disclaimer
-This repository is provided for authorized security testing, defensive auditing, and research.
-You are responsible for ensuring you have proper permission before running active checks.
+Would you like me to generate a specific requirements.txt file or a Python setup script for this project?
