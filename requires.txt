@@ -1,0 +1,5 @@
+aiohttp>=3.9.0
+dnspython>=2.4.0
+rich>=13.7.0
+ipwhois>=1.2.0
+idna>=3.6
