@@ -128,7 +128,7 @@ pip install -r requirements.txt
 * 🔒 **Active checks** are rate-limited and perform minimal interaction.
 * 🚫 **No exploit logic** or credential brute-forcing is included.
 
-**License:** GPLv3 (Copyleft)
+**License:** GNU
 
 **Disclaimer:** This tool is for authorized security testing only. Users are responsible for compliance with local laws and obtaining explicit permission before running active checks against any infrastructure.
 
