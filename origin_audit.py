@@ -2,11 +2,17 @@
 """
 cdn-origin-audit
 Author: AfterPacket (https://github.com/AfterPacket)
+Repo:   https://github.com/AfterPacket/cdn-origin-audit
 
 Passive-first, Cloudflare-aware origin exposure audit toolkit.
 Active web checks are gated behind --i-have-authorization.
 
-Repo: https://github.com/AfterPacket/cdn-origin-audit
+v0.2.0 updates:
+- Faster DNS: resolve record types concurrently per host
+- Wildcard DNS detection (+ filtering) to reduce false positives
+- Candidate expansion: permutations engine (optional)
+- Extra DNS posture: CAA, SOA, DMARC, DKIM selector probes (optional), SRV (optional)
+- SecurityTrails history printed + best-effort extracted values
 """
 
 import argparse
@@ -34,7 +40,7 @@ except Exception:
 CONSOLE = Console()
 
 TOOL_NAME = "cdn-origin-audit"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 AUTHOR = "AfterPacket"
 AUTHOR_URL = "https://github.com/AfterPacket"
 REPO_URL = "https://github.com/AfterPacket/cdn-origin-audit"
@@ -45,13 +51,26 @@ DEFAULT_SUBDOMAINS = [
     "git","gitlab","jira","grafana","status","dashboard","cdn","static","images",
     "m","mobile","app","portal","support","help","docs","blog","shop",
     "sso","auth","login","files","downloads","uploads","assets",
-    # extra common infra labels
-    "server","panel","webmin","grafana","prometheus","kibana","jenkins","ci","cd"
+    "server","panel","webmin","prometheus","kibana","jenkins","ci","cd","merch",
+    "store","checkout","cart","account","profile","orders","support","help","docs",
+    "blog","shop","sso","auth","login","files","downloads","uploads","assets",
+    "server","panel","webmin","prometheus","kibana","jenkins","ci","cd","merch","cdn","webmin","cpanel"
 ]
 
 DEFAULT_PATHS = [
     "/", "/robots.txt", "/sitemap.xml", "/.well-known/security.txt",
     "/.well-known/assetlinks.json", "/.well-known/apple-app-site-association"
+]
+
+# Common DKIM selectors (best-effort; this is just enumeration hygiene)
+DEFAULT_DKIM_SELECTORS = ["default", "google", "selector1", "selector2", "mail", "smtp", "dkim"]
+
+# Small SRV set (optional)
+DEFAULT_SRV = [
+    "_sip._tcp", "_sip._tls", "_sips._tcp",
+    "_xmpp-client._tcp", "_xmpp-server._tcp",
+    "_caldavs._tcp", "_carddavs._tcp",
+    "_imaps._tcp", "_submissions._tcp"
 ]
 
 # -----------------------------
@@ -66,6 +85,9 @@ class HostDNS:
     ns: List[str]
     mx: List[str]
     txt: List[str]
+    caa: List[str]
+    soa: List[str]
+    wildcard_suspect: bool = False  # flagged later
 
 @dataclass
 class HTTPBanner:
@@ -107,6 +129,7 @@ def _mode_label(args) -> str:
         _get_flag(args, "dns_history"),
         _get_flag(args, "reverseip"),
         (not _get_flag(args, "no_bruteforce")) or bool(_get_flag(args, "wordlist", None)),
+        _get_flag(args, "permutations"),
     ])
 
     active_requested = any([
@@ -131,6 +154,8 @@ def _enabled_sources(args) -> str:
         parts.append("wordlist/bruteforce")
     if _get_flag(args, "wordlist", None):
         parts.append("custom-wordlist")
+    if _get_flag(args, "permutations"):
+        parts.append("permutations")
     if _get_flag(args, "crtsh"):
         parts.append("crt.sh")
     if _get_flag(args, "securitytrails"):
@@ -145,6 +170,10 @@ def _enabled_sources(args) -> str:
         parts.append("HTTP banners")
     if _get_flag(args, "paths") or _get_flag(args, "paths_file", None):
         parts.append("Path checks")
+    if _get_flag(args, "probe_email"):
+        parts.append("DMARC/DKIM probes")
+    if _get_flag(args, "srv"):
+        parts.append("SRV probes")
     return ", ".join(parts) if parts else "-"
 
 def build_banner(args, target_domain: str = "") -> str:
@@ -173,10 +202,14 @@ def build_banner(args, target_domain: str = "") -> str:
 
 
 # -----------------------------
-# Helpers
+# General helpers
 # -----------------------------
 def normalize_host(h: str) -> str:
     return h.strip().lower().rstrip(".")
+
+def safe_ascii(s: str) -> str:
+    # keep output safe on Windows terminals
+    return s.encode("ascii", errors="replace").decode("ascii")
 
 async def run_blocking(fn, *args):
     loop = asyncio.get_running_loop()
@@ -223,7 +256,7 @@ async def fetch_json(
             if r.status >= 400:
                 if debug:
                     print(f"[yellow]API error[/yellow] {r.status} {url}")
-                    snippet = text[:300].replace("\n", " ")
+                    snippet = safe_ascii(text[:300].replace("\n", " "))
                     if snippet:
                         print(f"[dim]{snippet}[/dim]")
                 return None
@@ -284,7 +317,7 @@ def is_cloudflare_host(dns: HostDNS, cf_nets: List[ipaddress._BaseNetwork]) -> b
 
 
 # -----------------------------
-# DNS resolving
+# DNS resolving (faster: concurrent per host)
 # -----------------------------
 async def resolve_record(resolver: dns.asyncresolver.Resolver, host: str, rtype: str) -> List[str]:
     try:
@@ -295,14 +328,132 @@ async def resolve_record(resolver: dns.asyncresolver.Resolver, host: str, rtype:
 
 async def resolve_host(resolver: dns.asyncresolver.Resolver, host: str) -> HostDNS:
     host = normalize_host(host)
-    a = await resolve_record(resolver, host, "A")
-    aaaa = await resolve_record(resolver, host, "AAAA")
-    cname = await resolve_record(resolver, host, "CNAME")
-    ns = await resolve_record(resolver, host, "NS")
-    mx_raw = await resolve_record(resolver, host, "MX")
-    txt = await resolve_record(resolver, host, "TXT")
+
+    # Resolve in parallel
+    a_t = resolve_record(resolver, host, "A")
+    aaaa_t = resolve_record(resolver, host, "AAAA")
+    cname_t = resolve_record(resolver, host, "CNAME")
+    ns_t = resolve_record(resolver, host, "NS")
+    mx_t = resolve_record(resolver, host, "MX")
+    txt_t = resolve_record(resolver, host, "TXT")
+    caa_t = resolve_record(resolver, host, "CAA")
+    soa_t = resolve_record(resolver, host, "SOA")
+
+    a, aaaa, cname, ns, mx_raw, txt, caa, soa = await asyncio.gather(
+        a_t, aaaa_t, cname_t, ns_t, mx_t, txt_t, caa_t, soa_t
+    )
+
     mx = [re.split(r"\s+", x, maxsplit=1)[-1].rstrip(".") if " " in x else x.rstrip(".") for x in mx_raw]
-    return HostDNS(host=host, a=a, aaaa=aaaa, cname=cname, ns=ns, mx=mx, txt=txt)
+    return HostDNS(host=host, a=a, aaaa=aaaa, cname=cname, ns=ns, mx=mx, txt=txt, caa=caa, soa=soa)
+
+
+# -----------------------------
+# Wildcard DNS detection
+# -----------------------------
+async def wildcard_signature(resolver: dns.asyncresolver.Resolver, domain: str) -> Dict[str, Set[str]]:
+    """
+    Build a best-effort wildcard signature for the zone by resolving random labels.
+    If the zone has wildcard A/AAAA/CNAME, these results repeat for random hostnames.
+    """
+    domain = normalize_host(domain)
+    sig: Dict[str, Set[str]] = {"A": set(), "AAAA": set(), "CNAME": set()}
+
+    # Try a few random labels
+    for _ in range(3):
+        label = f"__w{random.randint(100000, 999999)}"
+        host = f"{label}.{domain}"
+        a, aaaa, cname = await asyncio.gather(
+            resolve_record(resolver, host, "A"),
+            resolve_record(resolver, host, "AAAA"),
+            resolve_record(resolver, host, "CNAME"),
+        )
+        for v in a:
+            sig["A"].add(v)
+        for v in aaaa:
+            sig["AAAA"].add(v)
+        for v in cname:
+            sig["CNAME"].add(v)
+
+    return sig
+
+def matches_wildcard(d: HostDNS, sig: Dict[str, Set[str]]) -> bool:
+    """
+    Mark as wildcard-suspect if ALL returned answers are within wildcard sig AND
+    at least one answer exists (i.e., it "resolved").
+    """
+    has_any = bool(d.a or d.aaaa or d.cname)
+    if not has_any:
+        return False
+
+    # If a type is present on host, it must be subset of sig to count as wildcard-ish.
+    def subset_or_empty(vals: List[str], allowed: Set[str]) -> bool:
+        return True if not vals else set(vals).issubset(allowed) and bool(allowed)
+
+    a_ok = subset_or_empty(d.a, sig["A"])
+    aaaa_ok = subset_or_empty(d.aaaa, sig["AAAA"])
+    cname_ok = subset_or_empty(d.cname, sig["CNAME"])
+
+    return a_ok and aaaa_ok and cname_ok
+
+
+# -----------------------------
+# Enumeration expansions (permutations)
+# -----------------------------
+def extract_labels(hosts: Set[str], domain: str) -> Set[str]:
+    domain = normalize_host(domain)
+    labels: Set[str] = set()
+    for h in hosts:
+        h = normalize_host(h)
+        if h == domain:
+            continue
+        if h.endswith("." + domain):
+            left = h[: -(len(domain) + 1)]
+            # only take first label (avoid deep)
+            first = left.split(".")[0].strip()
+            if first:
+                labels.add(first)
+    return labels
+
+def generate_permutations(labels: Set[str], domain: str, max_new: int = 1500) -> Set[str]:
+    """
+    Conservative permutation engine:
+    - env prefixes/suffixes: dev-, -dev, stage-, -staging, etc
+    - api/admin/auth combos
+    - hyphen joins among top labels
+    """
+    domain = normalize_host(domain)
+    envs = ["dev", "test", "stage", "staging", "prod", "old", "legacy", "beta"]
+    roles = ["api", "admin", "auth", "login", "portal", "app", "dashboard", "status", "cdn", "static"]
+
+    base = set(labels)
+    out: Set[str] = set()
+
+    def add(name: str):
+        if name and len(out) < max_new:
+            out.add(f"{name}.{domain}")
+
+    # Prefix/suffix env patterns
+    for l in base:
+        for e in envs:
+            add(f"{e}-{l}")
+            add(f"{l}-{e}")
+        for r in roles:
+            add(f"{r}-{l}")
+            add(f"{l}-{r}")
+
+    # role+env combos (common)
+    for r in roles:
+        for e in envs:
+            add(f"{r}-{e}")
+            add(f"{e}-{r}")
+
+    # simple joins of popular labels
+    top = sorted(list(base))[:60]
+    for i in range(min(len(top), 30)):
+        for j in range(i + 1, min(len(top), 30)):
+            add(f"{top[i]}-{top[j]}")
+
+    return out
 
 
 # -----------------------------
@@ -463,13 +614,6 @@ def st_summarize(obj: Any) -> str:
     return "keys=" + ",".join(list(obj.keys())[:8]) if obj else "empty"
 
 def st_extract_values(obj: Any, limit: int = 10) -> List[str]:
-    """
-    Best-effort extraction of values from SecurityTrails history responses.
-    Handles common shapes:
-      - {"records": [{"values": [{"ip": "1.2.3.4"}]}]}
-      - {"records": [{"values": [{"value": "target"}]}]}
-      - {"records": [{"values": ["1.2.3.4", ...]}]}
-    """
     if not isinstance(obj, dict):
         return []
     recs = obj.get("records")
@@ -501,16 +645,41 @@ def st_extract_values(obj: Any, limit: int = 10) -> List[str]:
                         add(item["hostname"])
                 else:
                     add(item)
-        # sometimes record may directly contain "ip" or "value"
         if "ip" in rec:
             add(rec["ip"])
         if "value" in rec:
             add(rec["value"])
-
         if len(out) >= limit:
             break
 
     return out[:limit]
+
+
+# -----------------------------
+# Extra DNS posture probes (optional)
+# -----------------------------
+async def probe_dmarc(resolver: dns.asyncresolver.Resolver, domain: str) -> List[str]:
+    return await resolve_record(resolver, f"_dmarc.{normalize_host(domain)}", "TXT")
+
+async def probe_dkim(resolver: dns.asyncresolver.Resolver, domain: str, selectors: List[str]) -> Dict[str, List[str]]:
+    domain = normalize_host(domain)
+    out: Dict[str, List[str]] = {}
+    for sel in selectors:
+        h = f"{sel}._domainkey.{domain}"
+        txt = await resolve_record(resolver, h, "TXT")
+        if txt:
+            out[sel] = txt
+    return out
+
+async def probe_srv(resolver: dns.asyncresolver.Resolver, domain: str, services: List[str]) -> Dict[str, List[str]]:
+    domain = normalize_host(domain)
+    out: Dict[str, List[str]] = {}
+    for svc in services:
+        h = f"{svc}.{domain}"
+        recs = await resolve_record(resolver, h, "SRV")
+        if recs:
+            out[svc] = recs
+    return out
 
 
 # -----------------------------
@@ -540,7 +709,6 @@ async def safe_banner_check(session: aiohttp.ClientSession, host: str, *, timeou
                     location=r.headers.get("Location"),
                 )
         except Exception:
-            # tiny GET fallback with Range
             try:
                 h2 = dict(headers)
                 h2["Range"] = "bytes=0-1024"
@@ -623,6 +791,13 @@ async def main():
     ap.add_argument("--no-banner", action="store_true", help="Disable banner output.")
     ap.add_argument("--debug-api", action="store_true", help="Print API HTTP errors/status for crt.sh / SecurityTrails / ViewDNS.")
 
+    # Enumeration controls
+    ap.add_argument("--permutations", action="store_true", help="Generate permutations from discovered labels (improves coverage).")
+    ap.add_argument("--perms-max", type=int, default=1500, help="Max generated permutation hostnames.")
+    ap.add_argument("--wildcard-detect", action="store_true", help="Detect wildcard DNS and mark/filter wildcard-suspect hosts.")
+    ap.add_argument("--show-nxdomain", action="store_true", help="Include unresolved hosts in DNS table (default hides them).")
+    ap.add_argument("--show-wildcards", action="store_true", help="Show wildcard-suspect hosts (default hides them when filtering).")
+
     # Passive sources
     ap.add_argument("--crtsh", action="store_true", help="Passive: crt.sh CT subdomain discovery.")
     ap.add_argument("--securitytrails", action="store_true", help="Passive: SecurityTrails subdomains + IP whois (key required).")
@@ -634,6 +809,14 @@ async def main():
     ap.add_argument("--no-bruteforce", action="store_true", help="Disable wordlist-based subdomain candidates.")
     ap.add_argument("--wordlist", help="Optional subdomain wordlist file.")
 
+    # Extra posture probes
+    ap.add_argument("--probe-email", action="store_true", help="Probe DMARC + common DKIM selectors (best-effort).")
+    ap.add_argument("--dkim-selectors", help="Comma-separated DKIM selectors (default: common).")
+    ap.add_argument("--srv", action="store_true", help="Probe a small set of SRV records (lightweight).")
+
+    # DNS settings
+    ap.add_argument("--dns-servers", help="Comma-separated DNS servers to use (overrides system resolver).")
+
     # Active checks (authorized only)
     ap.add_argument(
         "--i-have-authorization",
@@ -643,9 +826,9 @@ async def main():
     ap.add_argument("--http", action="store_true", help="Active: minimal HTTP banner checks (Server header).")
     ap.add_argument("--paths", action="store_true", help="Active: check a small set of safe paths (robots/sitemap/security.txt).")
     ap.add_argument("--paths-file", help="Active: path list file (one path per line). Use only with authorization.")
-    ap.add_argument("--max-hosts", type=int, default=2000, help="Safety cap: max hosts to resolve.")
-    ap.add_argument("--dns-concurrency", type=int, default=150)
-    ap.add_argument("--http-concurrency", type=int, default=10)
+    ap.add_argument("--max-hosts", type=int, default=4000, help="Safety cap: max hosts to resolve.")
+    ap.add_argument("--dns-concurrency", type=int, default=250)
+    ap.add_argument("--http-concurrency", type=int, default=15)
     ap.add_argument("--output", help="Write full JSON report to file.")
     args = ap.parse_args()
 
@@ -664,14 +847,24 @@ async def main():
     vd_key = os.getenv("VIEWDNS_APIKEY") if (args.viewdns or args.reverseip) else None
 
     resolver = dns.asyncresolver.Resolver()
+    # Optional custom DNS servers
+    if args.dns_servers:
+        servers = [s.strip() for s in args.dns_servers.split(",") if s.strip()]
+        if servers:
+            resolver.nameservers = servers
 
     async with aiohttp.ClientSession() as session:
         cf_nets = await fetch_cloudflare_networks(session)
 
-        # Build host set
+        # Wildcard signature (optional)
+        wc_sig: Optional[Dict[str, Set[str]]] = None
+        if args.wildcard_detect:
+            wc_sig = await wildcard_signature(resolver, domain)
+
+        # Build host set (candidates)
         hosts: Set[str] = {domain, f"www.{domain}"}
 
-        # Optional bruteforce
+        # bruteforce
         brutelist = list(DEFAULT_SUBDOMAINS)
         if args.wordlist:
             try:
@@ -687,14 +880,14 @@ async def main():
             for s in brutelist:
                 hosts.add(f"{s}.{domain}")
 
-        # Passive enrichment: crt.sh
+        # passive: crt.sh
         crt_hosts: Set[str] = set()
         if args.crtsh:
             crt_hosts = await crtsh_subdomains(session, domain, debug=debug_api)
             hosts |= crt_hosts
             print(f"\n[bold]crt.sh subdomains:[/bold] {len(crt_hosts)} found")
 
-        # Passive enrichment: SecurityTrails subdomains
+        # passive: SecurityTrails subdomains
         st_hosts: Set[str] = set()
         if args.securitytrails:
             if not st_key:
@@ -703,6 +896,14 @@ async def main():
                 st_hosts = await st_subdomains(session, st_key, domain, debug=debug_api)
                 hosts |= st_hosts
                 print(f"[bold]SecurityTrails subdomains:[/bold] {len(st_hosts)} found")
+
+        # Permutations expansion (optional)
+        perm_hosts: Set[str] = set()
+        if args.permutations:
+            labels = extract_labels(hosts, domain)
+            perm_hosts = generate_permutations(labels, domain, max_new=args.perms_max)
+            hosts |= perm_hosts
+            print(f"[bold]Permutations generated:[/bold] {len(perm_hosts)}")
 
         # Passive: ViewDNS IP history (apex)
         vd_ip_history: List[Dict[str, Any]] = []
@@ -716,7 +917,7 @@ async def main():
         if len(hosts) > args.max_hosts:
             hosts = set(list(hosts)[: args.max_hosts])
 
-        # Resolve DNS
+        # Resolve DNS (concurrent)
         dns_results: Dict[str, HostDNS] = {}
         sem = asyncio.Semaphore(args.dns_concurrency)
 
@@ -725,6 +926,14 @@ async def main():
                 dns_results[h] = await resolve_host(resolver, h)
 
         await asyncio.gather(*(resolve_one(h) for h in sorted(hosts)))
+
+        # Wildcard tagging/filtering
+        wildcard_hits: Set[str] = set()
+        if wc_sig:
+            for h, d in dns_results.items():
+                if matches_wildcard(d, wc_sig):
+                    d.wildcard_suspect = True
+                    wildcard_hits.add(h)
 
         # CF & origin candidate IPs
         cf_hosts: Set[str] = set()
@@ -737,7 +946,7 @@ async def main():
                 if ip and not is_cloudflare_ip(ip, cf_nets):
                     origin_candidate_ips.add(ip)
 
-        # Passive: SecurityTrails DNS history (apex + www)
+        # SecurityTrails DNS history (apex + www)
         st_dns_hist: Dict[str, Any] = {}
         if args.dns_history:
             if not st_key:
@@ -750,6 +959,21 @@ async def main():
                         "cname": await st_dns_history(session, st_key, hn, "cname", debug=debug_api),
                     }
 
+        # Extra posture probes
+        dmarc_txt: List[str] = []
+        dkim_txt: Dict[str, List[str]] = {}
+        srv_records: Dict[str, List[str]] = {}
+
+        if args.probe_email:
+            dmarc_txt = await probe_dmarc(resolver, domain)
+            sels = DEFAULT_DKIM_SELECTORS
+            if args.dkim_selectors:
+                sels = [s.strip() for s in args.dkim_selectors.split(",") if s.strip()]
+            dkim_txt = await probe_dkim(resolver, domain, sels)
+
+        if args.srv:
+            srv_records = await probe_srv(resolver, domain, DEFAULT_SRV)
+
         # Enrich IPs
         enriched_ips: Dict[str, IPEnrichment] = {}
         if origin_candidate_ips:
@@ -761,7 +985,7 @@ async def main():
 
             await asyncio.gather(*(enrich_one(ip) for ip in sorted(origin_candidate_ips)))
 
-        # Passive: Reverse IP via ViewDNS
+        # Reverse IP via ViewDNS (only for candidate IPs)
         reverseip_results: Dict[str, List[Dict[str, Any]]] = {}
         if args.reverseip:
             if not vd_key:
@@ -783,8 +1007,14 @@ async def main():
             print("[red]Active checks requested but --i-have-authorization was NOT provided. Skipping all active checks.[/red]")
 
         if args.i_have_authorization:
+            # only check resolved & non-wildcard unless explicitly showing wildcards
             interesting = {domain, f"www.{domain}"}
             for h, d in dns_results.items():
+                resolved = bool(d.a or d.aaaa or d.cname)
+                if not resolved:
+                    continue
+                if d.wildcard_suspect and not args.show_wildcards:
+                    continue
                 if any(ip and not is_cloudflare_ip(ip, cf_nets) for ip in d.a + d.aaaa):
                     interesting.add(h)
 
@@ -817,22 +1047,49 @@ async def main():
         # -----------------------------
         # Console report
         # -----------------------------
+        # Decide which hosts to display in table
+        def include_row(d: HostDNS) -> bool:
+            resolved = bool(d.a or d.aaaa or d.cname or d.ns or d.mx or d.txt or d.caa or d.soa)
+            if args.show_nxdomain:
+                # show everything
+                return True
+            if not resolved:
+                return False
+            if d.wildcard_suspect and not args.show_wildcards:
+                return False
+            return True
+
         t = Table(title=f"DNS Summary — {domain}")
         t.add_column("Host", style="cyan", no_wrap=True)
         t.add_column("A/AAAA")
         t.add_column("CNAME")
         t.add_column("NS")
-        t.add_column("Cloudflare?")
+        t.add_column("MX")
+        t.add_column("CF?")
+        t.add_column("WC?")
 
+        shown = 0
         for h in sorted(dns_results.keys()):
             d = dns_results[h]
+            if not include_row(d):
+                continue
             ips = ", ".join(d.a + d.aaaa) if (d.a or d.aaaa) else "-"
             cn = ", ".join(d.cname) if d.cname else "-"
             ns = ", ".join(d.ns) if d.ns else "-"
+            mx = ", ".join(d.mx) if d.mx else "-"
             cf = "YES" if h in cf_hosts else "NO"
-            t.add_row(h, ips, cn, ns, cf)
+            wc = "YES" if d.wildcard_suspect else "NO"
+            t.add_row(h, ips, cn, ns, mx, cf, wc)
+            shown += 1
+
+            # safety: avoid massive tables
+            if shown >= 300 and not args.show_nxdomain:
+                break
 
         CONSOLE.print(t)
+
+        if wildcard_hits and not args.show_wildcards:
+            print(f"\n[dim]Wildcard detected: {len(wildcard_hits)} wildcard-suspect host(s) filtered (use --show-wildcards to view).[/dim]")
 
         if enriched_ips:
             it = Table(title="Non-Cloudflare IPs Exposed via DNS (candidates)")
@@ -865,7 +1122,6 @@ async def main():
                 cname_obj = hist.get("cname")
                 print(f"  • {hn}: A({st_summarize(a_obj)}) AAAA({st_summarize(aaaa_obj)}) CNAME({st_summarize(cname_obj)})")
 
-                # show a few extracted values (best-effort)
                 a_vals = st_extract_values(a_obj, limit=8)
                 aaaa_vals = st_extract_values(aaaa_obj, limit=8)
                 cname_vals = st_extract_values(cname_obj, limit=8)
@@ -879,16 +1135,35 @@ async def main():
 
         if vd_ip_history:
             print("\n[bold]ViewDNS IP History (apex):[/bold]")
-            shown, seen = 0, set()
+            shown2, seen = 0, set()
             for rec in vd_ip_history:
                 ip = rec.get("ip")
                 if not isinstance(ip, str) or ip in seen:
                     continue
                 seen.add(ip)
                 print(f"  • {ip} owner={rec.get('owner','?')} lastseen={rec.get('lastseen','')}")
-                shown += 1
-                if shown >= 10:
+                shown2 += 1
+                if shown2 >= 10:
                     break
+
+        if args.probe_email:
+            print("\n[bold]Email DNS posture (best-effort):[/bold]")
+            if dmarc_txt:
+                print("  • DMARC (_dmarc): found")
+            else:
+                print("  • DMARC (_dmarc): not found")
+            if dkim_txt:
+                print(f"  • DKIM selectors found: {', '.join(sorted(dkim_txt.keys()))}")
+            else:
+                print("  • DKIM selectors found: none (or not using common selectors)")
+
+        if args.srv:
+            print("\n[bold]SRV probes (best-effort):[/bold]")
+            if srv_records:
+                for k, v in srv_records.items():
+                    print(f"  • {k}: {len(v)} record(s)")
+            else:
+                print("  • none found in default list")
 
         if reverseip_results:
             print("\n[bold]Reverse IP (ViewDNS) for candidate IPs:[/bold]")
@@ -918,14 +1193,23 @@ async def main():
         report = {
             "tool": {"name": TOOL_NAME, "version": VERSION, "author": AUTHOR, "author_url": AUTHOR_URL, "repo_url": REPO_URL},
             "domain": domain,
+            "counts": {
+                "candidates_total": len(hosts),
+                "dns_resolved_hosts": sum(1 for d in dns_results.values() if (d.a or d.aaaa or d.cname)),
+                "wildcard_suspects": len(wildcard_hits),
+                "cloudflare_hosts": len(cf_hosts),
+                "origin_candidate_ips": len(origin_candidate_ips),
+            },
             "sources": {
                 "crtsh_hosts": sorted(crt_hosts),
                 "securitytrails_hosts": sorted(st_hosts),
+                "permutation_hosts": sorted(list(perm_hosts))[:2000],  # cap for json size
                 "viewdns_enabled": bool(args.viewdns),
                 "securitytrails_enabled": bool(args.securitytrails),
                 "dns_history_enabled": bool(args.dns_history),
                 "reverseip_enabled": bool(args.reverseip),
                 "bruteforce_enabled": not args.no_bruteforce,
+                "wildcard_detect_enabled": bool(args.wildcard_detect),
             },
             "dns": {h: asdict(d) for h, d in dns_results.items()},
             "cloudflare_hosts": sorted(cf_hosts),
@@ -934,6 +1218,8 @@ async def main():
             "securitytrails_dns_history": st_dns_hist,
             "viewdns_ip_history": vd_ip_history,
             "reverse_ip": reverseip_results,
+            "email_probes": {"dmarc_txt": dmarc_txt, "dkim_txt": dkim_txt},
+            "srv_records": srv_records,
             "http_banners_authorized": http_results,
             "path_checks_authorized": path_results,
         }
@@ -942,6 +1228,7 @@ async def main():
             with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
             print(f"\n[green]Wrote JSON report:[/green] {args.output}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
