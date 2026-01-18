@@ -100,6 +100,83 @@ class IPEnrichment:
 # -----------------------------
 # Helpers
 # -----------------------------
+def _get_flag(args, name: str, default=False):
+    return getattr(args, name, default)
+
+def _mode_label(args) -> str:
+    passive_flags = any([
+        _get_flag(args, "crtsh"),
+        _get_flag(args, "securitytrails"),
+        _get_flag(args, "viewdns"),
+        _get_flag(args, "dns_history"),
+        _get_flag(args, "reverseip"),
+        (not _get_flag(args, "no_bruteforce")) or bool(_get_flag(args, "wordlist", None)),
+    ])
+
+    active_requested = any([
+        _get_flag(args, "http"),
+        _get_flag(args, "paths"),
+        bool(_get_flag(args, "paths_file", None)),
+    ])
+
+    authorized = _get_flag(args, "i_have_authorization")
+
+    if active_requested and authorized:
+        return "ACTIVE (AUTHORIZED)"
+    if active_requested and not authorized:
+        return "ACTIVE REQUESTED (BLOCKED - missing --i-have-authorization)"
+    if passive_flags:
+        return "PASSIVE+ (OSINT enabled)"
+    return "PASSIVE"
+
+def _enabled_sources(args) -> str:
+    parts = []
+    if not _get_flag(args, "no_bruteforce"):
+        parts.append("wordlist/bruteforce")
+    if _get_flag(args, "wordlist", None):
+        parts.append("custom-wordlist")
+    if _get_flag(args, "crtsh"):
+        parts.append("crt.sh")
+    if _get_flag(args, "securitytrails"):
+        parts.append("SecurityTrails")
+    if _get_flag(args, "viewdns"):
+        parts.append("ViewDNS")
+    if _get_flag(args, "dns_history"):
+        parts.append("DNS history")
+    if _get_flag(args, "reverseip"):
+        parts.append("Reverse IP")
+    if _get_flag(args, "http"):
+        parts.append("HTTP banners")
+    if _get_flag(args, "paths") or _get_flag(args, "paths_file", None):
+        parts.append("Path checks")
+    return ", ".join(parts) if parts else "-"
+
+def build_banner(args, target_domain: str = "") -> str:
+    mode = _mode_label(args)
+    sources = _enabled_sources(args)
+
+    # Optional: show target
+    target_line = f"[dim]Target:[/dim] {target_domain}\n" if target_domain else ""
+
+    if mode.startswith("ACTIVE (AUTHORIZED)"):
+        color = "green"
+    elif mode.startswith("ACTIVE REQUESTED"):
+        color = "red"
+    elif mode.startswith("PASSIVE+"):
+        color = "cyan"
+    else:
+        color = "blue"
+
+    return (
+        f"\n[bold {color}]{TOOL_NAME}[/bold {color}]  [white]{VERSION}[/white]\n"
+        f"[dim]Author:[/dim] [bold]{AUTHOR}[/bold]  [blue]{AUTHOR_URL}[/blue]\n"
+        f"[dim]Repo:[/dim]   [blue]{REPO_URL}[/blue]\n"
+        f"{target_line}"
+        f"[dim]Mode:[/dim]   [bold]{mode}[/bold]\n"
+        f"[dim]Enabled:[/dim] {sources}\n"
+    )
+
+
 def normalize_host(h: str) -> str:
     return h.strip().lower().rstrip(".")
 
@@ -439,7 +516,10 @@ async def main():
         return
 
     if not args.no_banner:
-        CONSOLE.print(BANNER)
+       # domain is already normalized shortly after parsing in your script
+       # If you print before normalization, just pass args.domain
+       CONSOLE.print(build_banner(args, target_domain=args.domain))
+
 
     domain = normalize_host(args.domain)
 
