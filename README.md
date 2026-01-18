@@ -226,7 +226,6 @@ JSON output (--output) includes structured data for:
 
 PROJECT STRUCTURE
 
-.
 ├── origin_audit.py     # Main application
 ├── requirements.txt    # Standard pip dependencies
 ├── requires.txt        # Alternate dependency list
