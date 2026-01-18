@@ -76,7 +76,12 @@ ViewDNS: VIEWDNS_APIKEY
 export SECURITYTRAILS_APIKEY="YOUR_KEY"
 export VIEWDNS_APIKEY="YOUR_KEY"
 ```
+For Windows 
 
+```bash
+ $env:SECURITYTRAILS_APIKEY="YOUR_KEY"
+ $env:VIEWDNS_APIKEY=""
+```
 Usage
 Passive OSINT only (recommended baseline)
 ```bash
