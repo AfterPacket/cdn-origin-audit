@@ -80,7 +80,7 @@ For Windows
 
 ```bash
  $env:SECURITYTRAILS_APIKEY="YOUR_KEY"
- $env:VIEWDNS_APIKEY=""
+ $env:VIEWDNS_APIKEY="YOUR_KEY"
 ```
 Usage
 Passive OSINT only (recommended baseline)
