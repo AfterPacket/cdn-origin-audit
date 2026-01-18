@@ -54,6 +54,9 @@ This tool helps you:
 ├── requires.txt
 ├── requirements.txt
 └── README.md
+
+```
+
 Install
 Option A: install from requires.txt (this repo)
 bash
@@ -69,14 +72,15 @@ SecurityTrails: SECURITYTRAILS_APIKEY
 
 ViewDNS: VIEWDNS_APIKEY
 
-bash
-Copy code
+```bash
 export SECURITYTRAILS_APIKEY="YOUR_KEY"
 export VIEWDNS_APIKEY="YOUR_KEY"
+```
+
 Usage
 Passive OSINT only (recommended baseline)
-bash
-Copy code
+```bash
+
 python origin_audit.py example.com \
   --crtsh \
   --securitytrails \
@@ -85,38 +89,41 @@ python origin_audit.py example.com \
   --reverseip \
   --output passive_report.json
 Authorized active testing (your domains / explicit permission only)
-bash
-Copy code
+```
+```bash
+
 python origin_audit.py example.com \
   --http \
   --paths \
   --i-have-authorization \
   --output active_report.json
 Custom subdomain wordlist
-bash
-Copy code
+```
+```bash
 python origin_audit.py example.com \
   --wordlist subdomains.txt \
   --crtsh \
   --output report.json
 Custom path list (authorized only)
 Create paths.txt:
+```
+```txt
 
-txt
-Copy code
 /admin
 /login
 /status
 /health
 /.well-known/security.txt
+```
 Run:
 
-bash
-Copy code
+```bash
 python origin_audit.py example.com \
   --paths-file paths.txt \
   --i-have-authorization \
   --output paths_report.json
+```
+
 Output
 Console tables
 DNS summary per host
@@ -166,11 +173,7 @@ Safety / Ethics
 Use only for systems you own or where you have explicit written permission.
 
 License
-Pick a license that fits your deployment:
 
-MIT (permissive)
-
-Apache-2.0 (patent grant)
 
 GPLv3 (copyleft)
 
