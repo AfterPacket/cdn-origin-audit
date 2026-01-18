@@ -159,7 +159,7 @@ reverse IP results (if enabled)
 
 authorized banner/path results (if enabled)
 
-Safety / Ethics
+##Safety / Ethics
 ✅ Passive OSINT features are safe and low risk.
 
 🔒 Active web checks are rate-limited and minimal.
@@ -172,11 +172,11 @@ Safety / Ethics
 
 Use only for systems you own or where you have explicit written permission.
 
-License
+##License
 
 
 GPLv3 (copyleft)
 
-Disclaimer
+##Disclaimer
 This repository is provided for authorized security testing, defensive auditing, and research.
 You are responsible for ensuring you have proper permission before running active checks.
