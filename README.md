@@ -1,181 +1,136 @@
-cdn-origin-audit 🔎🛡️
-Passive-first subdomain + DNS + hosting attribution toolkit for authorized security testing and defensive audits.
+# cdn-origin-audit 🔎🛡️
 
-Built and maintained by AfterPacket
+**Passive-first** subdomain + DNS + hosting attribution toolkit for **authorized security testing** and defensive audits.
 
-Overview
-This tool streamlines the process of uncovering infrastructure origins and bypasses. It helps you:
+Built and maintained by **AfterPacket** [](https://github.com/AfterPacket)
+[](https://github.com/AfterPacket/cdn-origin-audit)
 
-Discover historical subdomains via Certificate Transparency (crt.sh).
+---
 
-Pull DNS history via SecurityTrails (apex + www) and ViewDNS (IP history).
+## Overview
 
-Run reverse IP lookups to understand shared hosting / neighbors (ViewDNS).
+`cdn-origin-audit` helps security professionals and site owners discover infrastructure origins that may be exposed despite being behind a CDN (like Cloudflare).
 
-Fingerprint cloud providers (AWS / GCP / Azure) via PTR + RDAP/WHOIS.
+* **Discover historical subdomains** via Certificate Transparency (**crt.sh**).
+* **Pull DNS history** via **SecurityTrails** (apex + `www`) and **ViewDNS** (IP history).
+* **Identify shared hosting** neighbors via **reverse IP lookups** (ViewDNS).
+* **Fingerprint cloud providers** (AWS / GCP / Azure) via PTR + RDAP/WHOIS.
+* **Verify origin responsiveness** via safe HTTP banner and path checks.
 
-Perform safe HTTP banner checks and path checks only when authorized.
+> [!IMPORTANT]
+> **Defensive Posture:** Passive OSINT is the default mode. Active network checks (HTTP/Path probes) are strictly opt-in and require the `--i-have-authorization` flag.
 
-[!IMPORTANT] ✅ Designed for defensive work and professional audits.
+---
 
-🔒 Passive OSINT is the default posture.
+## 🛠️ Usage
 
-⚠️ Active checks require the --i-have-authorization flag.
+### Full Command Syntax
 
-Features
-📡 Passive (OSINT) Recon
-crt.sh CT log scraping for historical subdomains.
+```text
+usage: origin_audit.py [-h] [--version] [--no-banner] [--debug-api] [--crtsh] [--securitytrails] [--viewdns]
+                       [--dns-history] [--reverseip] [--no-bruteforce] [--wordlist WORDLIST] [--i-have-authorization]
+                       [--http] [--paths] [--paths-file PATHS_FILE] [--max-hosts MAX_HOSTS]
+                       [--dns-concurrency DNS_CONCURRENCY] [--http-concurrency HTTP_CONCURRENCY] [--output OUTPUT]
+                       domain
 
-SecurityTrails subdomain discovery (via API).
+```
 
-DNS resolution: A / AAAA / CNAME / NS / MX / TXT.
+### 🚀 Sample Scenarios
 
-Cloudflare detection:
+**1. Baseline Passive OSINT (Safest)**
+Recommended for initial reconnaissance without touching the target's infrastructure.
 
-NS (*.ns.cloudflare.com)
+```bash
+python origin_audit.py example.com --crtsh --securitytrails --dns-history --output report.json
 
-CNAME (cdn.cloudflare.net)
+```
 
-Cloudflare published IP ranges (v4/v6).
+**2. Historical Origin Discovery**
+Leverages API keys to find IP addresses previously associated with the domain.
 
-Origin candidate identification: Collects non-Cloudflare A/AAAA IPs exposed by subdomains.
+```bash
+python origin_audit.py example.com --viewdns --dns-history --reverseip --debug-api
 
-Provider fingerprinting:
+```
 
-PTR + RDAP/WHOIS enrichment.
+**3. Authorized Origin Verification**
+Verifies if discovered "Origin Candidate" IPs are serving web content.
 
-Heuristics for AWS / GCP / Azure / Cloudflare.
-
-DNS History:
-
-SecurityTrails: Summary + extraction of historical A/AAAA/CNAME values.
-
-ViewDNS IP history: Shows historical IPs and last-seen dates.
-
-Reverse IP lookups: Identify other domains sharing candidate IPs to scope shared infra.
-
-⚡ Authorized Active Checks (Opt-in)
-Safe HTTP banner checks: Uses HEAD requests with a tiny GET fallback.
-
-Subfolder/path checks: Conservative defaults (e.g., robots.txt, sitemap.xml, /.well-known/security.txt).
-
-Data Captured: Status codes, Server headers, and redirects (Location).
-
-Project Layout
-Plaintext
-
-.
-├── origin_audit.py     # Main engine
-├── requires.txt        # Dependency list
-├── requirements.txt    # Standard dependency list
-└── README.md           # Documentation
-Installation
-You can install dependencies using either file provided in the repository:
-
-Bash
-
-# Option A: Standard install
-pip install -r requirements.txt
-
-# Option B: Alternative install
-pip install -r requires.txt
-API Keys (Optional)
-To enable advanced passive enrichment, set your API keys as environment variables.
-
-Service	Variable Name
-SecurityTrails	SECURITYTRAILS_APIKEY
-ViewDNS	VIEWDNS_APIKEY
-
-Export to Sheets
-
-Configuration
-Linux / macOS
-
-Bash
-
-export SECURITYTRAILS_APIKEY="YOUR_KEY"
-export VIEWDNS_APIKEY="YOUR_KEY"
-Windows (PowerShell)
-
-PowerShell
-
-$env:SECURITYTRAILS_APIKEY="YOUR_KEY"
-$env:VIEWDNS_APIKEY="YOUR_KEY"
-Usage Examples
-1. Passive OSINT Only (Recommended Baseline)
-Bash
-
+```bash
 python origin_audit.py example.com \
   --crtsh \
-  --securitytrails \
-  --viewdns \
-  --dns-history \
-  --reverseip \
-  --output passive_report.json
-2. Authorized Active Testing
-Use only on domains you own or have explicit permission to test.
-
-Bash
-
-python origin_audit.py example.com \
   --http \
   --paths \
-  --i-have-authorization \
-  --output active_report.json
-3. Custom Subdomain & Path Audits
-Bash
+  --i-have-authorization
 
-# Using a custom subdomain wordlist
-python origin_audit.py example.com --wordlist subdomains.txt --crtsh
+```
 
-# Using a custom path list for active checks
-python origin_audit.py example.com \
-  --paths-file paths.txt \
-  --i-have-authorization \
-  --output paths_report.json
-Output Data
-Console Output
-DNS summary per host and Cloudflare detection flags.
+---
 
-Origin candidate IP summary (non-Cloudflare exposures).
+## ⚙️ Configuration & API Keys
 
-SecurityTrails & ViewDNS history summaries.
+To enable full functionality, set the following environment variables:
 
-Authorized-only results (HTTP banners/Paths) if enabled.
+| Service | Variable Name | Function |
+| --- | --- | --- |
+| **SecurityTrails** | `SECURITYTRAILS_APIKEY` | Subdomain discovery & DNS history |
+| **ViewDNS** | `VIEWDNS_APIKEY` | IP history & Reverse IP lookups |
 
-JSON Report
-Use --output report.json to export structured data including:
+**Setup (Linux/macOS):**
 
-Discovered subdomains grouped by source.
+```bash
+export SECURITYTRAILS_APIKEY="YOUR_KEY"
+export VIEWDNS_APIKEY="YOUR_KEY"
 
-Full DNS record sets.
+```
 
-Enriched IP metadata (RDAP/WHOIS).
+---
 
-Reverse IP and History results.
+## 📋 Argument Reference
 
-CLI Flag Reference
-Flag	Description
---securitytrails	SecurityTrails subdomain discovery
---dns-history	SecurityTrails DNS history (apex + www)
---crtsh	CT-based historical subdomains
---viewdns	ViewDNS IP history
---reverseip	Reverse-IP lookups (ViewDNS)
---debug-api	Show API failures (401/429/etc.)
---i-have-authorization	Required to enable active checks
---http / --paths	Enable banner and path checking
+| Flag | Description |
+| --- | --- |
+| `--crtsh` | Scrapes crt.sh for subdomains found in SSL/TLS certificates. |
+| `--securitytrails` | Queries SecurityTrails for subdomains. |
+| `--viewdns` | Queries ViewDNS for historical IP records. |
+| `--dns-history` | Extracts historical A/AAAA/CNAME values from SecurityTrails. |
+| `--reverseip` | Identifies other domains hosted on candidate IPs. |
+| `--i-have-authorization` | **Required** to enable `--http` and `--paths`. |
+| `--http` | Performs safe HTTP banner grabbing (`HEAD` -> `GET`). |
+| `--paths` | Checks for `/robots.txt`, `/.well-known/security.txt`, etc. |
+| `--output` | Saves all structured data to a JSON file. |
 
-Export to Sheets
+---
 
-Safety & Ethics
-✅ Passive OSINT features are safe and low-risk.
+## 📁 Project Structure
 
-🔒 Active web checks are rate-limited and minimal.
+```text
+.
+├── origin_audit.py     # Main application logic
+├── requirements.txt    # Standard pip dependencies
+├── requires.txt        # Alternative dependency list
+└── README.md           # Documentation
 
-🚫 No exploit logic, credential attacks, or access control bypassing.
+```
 
-License: GPLv3 (Copyleft)
+### Installation
 
-Disclaimer: This repository is provided for authorized security testing and defensive auditing. You are responsible for ensuring you have proper permission before running active checks.
+```bash
+pip install -r requirements.txt
 
-Would you like me to generate a specific requirements.txt file or a Python setup script for this project?
+```
+
+---
+
+## 🛡️ Safety & Ethics
+
+* ✅ **Passive OSINT** features are designed to be safe and low-profile.
+* 🔒 **Active checks** are rate-limited and perform minimal interaction.
+* 🚫 **No exploit logic** or credential brute-forcing is included.
+
+**License:** GPLv3 (Copyleft)
+
+**Disclaimer:** This tool is for authorized security testing only. Users are responsible for compliance with local laws and obtaining explicit permission before running active checks against any infrastructure.
+
+---
+
